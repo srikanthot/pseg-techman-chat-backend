@@ -1,5 +1,5 @@
 """
-FastAPI application entry point for the PSEG Tech Manual Chat Backend.
+FastAPI application entry point for the PSEG Tech Manual Agent Backend.
 
 Production startup command (Azure App Service):
     gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 app.main:app
@@ -27,40 +27,46 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan — runs startup logic before yielding to requests."""
-    logger.info("PSEG Tech Manual Chat Backend starting up")
+    """Application lifespan — runs startup logging before yielding to requests."""
+    logger.info("PSEG Tech Manual Agent Backend starting up")
     logger.info(
         "Authentication: DefaultAzureCredential (Managed Identity / Azure CLI)"
     )
+    logger.info(
+        "Orchestration: Microsoft Agent Framework SDK "
+        "(AzureOpenAIChatClient + RagContextProvider)"
+    )
     logger.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
     yield
-    logger.info("PSEG Tech Manual Chat Backend shutting down")
+    logger.info("PSEG Tech Manual Agent Backend shutting down")
 
 
 app = FastAPI(
-    title="PSEG Tech Manual Chat Backend",
+    title="PSEG Tech Manual Agent Backend",
     description=(
-        "RAG-based chat API for PSEG field technician manuals.\n\n"
+        "Agent Framework SDK-based RAG API for PSEG field technician manuals.\n\n"
         "**Authentication:** Managed Identity (DefaultAzureCredential) — no API keys.\n\n"
-        "**Primary endpoint:** `POST /chat` — returns a complete JSON response "
-        "suitable for Power Apps / PCF integration.\n\n"
+        "**Orchestration:** Microsoft Agent Framework SDK — AzureOpenAIChatClient, "
+        "RagContextProvider (BaseContextProvider), InMemoryHistoryProvider.\n\n"
+        "**Primary endpoint:** `POST /chat` — complete JSON response for "
+        "Power Apps / PCF integration.\n\n"
         "**Streaming endpoint:** `POST /chat/stream` — Server-Sent Events for "
         "live token streaming."
     ),
-    version="2.2.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# ALLOWED_ORIGINS is always a list of explicit origins (never a wildcard).
-# Default: ["http://localhost:3000", "http://localhost:8000"] for local dev.
-# Production: set ALLOWED_ORIGINS env var to your Power Apps / PCF domains.
+# ALLOWED_ORIGINS is always an explicit list of origins — never ["*"].
+# Parsed from the ALLOWED_ORIGINS environment variable (comma-separated).
+# Default for local dev: http://localhost:3000,http://localhost:8000
+# Production: set ALLOWED_ORIGINS to your Power Apps / PCF domains.
 #
-# Because we always use a specific origin list, allow_credentials=True is
-# valid here. The CORS spec only forbids combining allow_origins=["*"] with
-# allow_credentials=True — explicit origin lists are always safe with credentials.
+# Using an explicit origin list means allow_credentials=True is valid:
+# the CORS spec only forbids combining allow_origins=["*"] with credentials.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

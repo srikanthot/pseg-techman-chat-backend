@@ -1,16 +1,17 @@
 """
-Pydantic models for API request and response validation.
+Pydantic request / response models for the chat API.
 
-ChatResponse is the stable contract consumed by the Power Apps / PCF integration.
-Do not change field names without coordinating with the consuming team.
+ChatResponse is the stable contract consumed by Power Apps / PCF integrations.
+Do not rename fields without coordinating with the consuming team.
 """
 
 from typing import Optional
+
 from pydantic import BaseModel
 
 
 class ChatRequest(BaseModel):
-    """Request body for both /chat and /chat/stream."""
+    """Request body for both POST /chat and POST /chat/stream."""
 
     question: str
     session_id: Optional[str] = None
@@ -28,7 +29,7 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """A single source reference from the retrieved manuals."""
+    """A single source reference from the retrieved technical manuals."""
 
     source: str
     title: str = ""
@@ -41,7 +42,7 @@ class Citation(BaseModel):
 class ChatResponse(BaseModel):
     """Response body from the non-streaming POST /chat endpoint.
 
-    This is the primary integration contract for Power Apps / PCF consumers.
+    Primary integration contract for Power Apps / PCF consumers.
     """
 
     answer: str
@@ -52,7 +53,7 @@ class ChatResponse(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "answer": "According to the manual [1], the pressure test procedure...\n\nSources:\n- gas_service_manual.pdf, Section: Pressure Testing",
+                    "answer": "According to the manual [1], the pressure test procedure...\n\nSources:\n- gas_service_manual.pdf",
                     "citations": [
                         {
                             "source": "gas_service_manual.pdf",
@@ -71,6 +72,6 @@ class ChatResponse(BaseModel):
 
 
 class CitationsPayload(BaseModel):
-    """Payload for the SSE 'citations' named event in /chat/stream."""
+    """Payload for the SSE ``citations`` named event in POST /chat/stream."""
 
     citations: list[Citation]

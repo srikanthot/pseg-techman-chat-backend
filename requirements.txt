@@ -8,6 +8,7 @@ python-dotenv==1.0.1
 pydantic>=2,<3
 
 # ── Azure Identity (Managed Identity / DefaultAzureCredential) ────────────────
+# Used by: SearchClient (retrieval), AzureOpenAI embeddings, AzureOpenAIChatClient
 azure-identity>=1.17.0
 
 # ── Azure AI Search ───────────────────────────────────────────────────────────
@@ -15,5 +16,14 @@ azure-identity>=1.17.0
 azure-search-documents==11.6.0b3
 
 # ── Azure OpenAI ──────────────────────────────────────────────────────────────
-# Requires AsyncAzureOpenAI and azure_ad_token_provider support (1.x series)
-openai>=1.30.0
+# openai>=2.0.0 required for agent-framework-core compatibility
+# azure_ad_token_provider supported on both AzureOpenAI and AsyncAzureOpenAI
+openai>=2.0.0
+
+# ── Microsoft Agent Framework SDK ─────────────────────────────────────────────
+# Provides: AzureOpenAIChatClient, client.as_agent(), InMemoryHistoryProvider,
+#           BaseContextProvider, SessionContext, AgentSession
+agent-framework-core==1.0.0rc3
+
+# ── HTTP client (used by openai and Agent Framework SDK internally) ────────────
+httpx>=0.27.1

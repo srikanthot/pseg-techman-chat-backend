@@ -1,6 +1,7 @@
-# PSEG Tech Manual Chat Backend
+# PSEG Tech Manual Agent Backend
 
-A production-ready FastAPI backend for the PSEG field technician chat assistant.
+A production-ready FastAPI backend for the PSEG field technician chat assistant,
+built on the **Microsoft Agent Framework SDK** pattern.
 
 **Hybrid RAG** (BM25 + vector) over Azure AI Search, grounded answers from Azure OpenAI,
 **no API keys** — all authentication via Managed Identity (DefaultAzureCredential).
@@ -10,31 +11,97 @@ Designed to be hosted on **Azure App Service on Linux** and consumed by a
 
 ---
 
+## Architecture
+
+```
+POST /chat  (or /chat/stream)
+     │
+     ▼
+routes.py                    thin: validate → AgentSession → AgentRuntime
+     │
+     ▼
+AgentRuntime (agent_runtime/agent.py)
+  │
+  ├─ 1.  retrieve()          asyncio.to_thread → tools/retrieval_tool.py
+  │        embed query (managed identity) → hybrid Azure AI Search (managed identity)
+  │        keyword distil → VectorizedQuery → semantic reranker → diversity/gap filters
+  │
+  ├─ 2.  Confidence gate     score-first: top chunk score >= threshold → pass
+  │        (not average-based; no hard count-only fail)
+  │
+  ├─ 3.  build_citations()   always from retrieval — never from LLM answer text
+  │
+  ├─ 4.  rag_provider        store_results(af_session, results) → session.state
+  │        (RagContextProvider will read this in before_run())
+  │
+  └─ 5.  af_agent.run()      Microsoft Agent Framework SDK ChatAgent
+              │
+              ├─ InMemoryHistoryProvider.before_run()   (optional, ENABLE_IN_MEMORY_HISTORY)
+              │    prepend conversation history to context
+              │
+              ├─ RagContextProvider.before_run()        ← key AF SDK hook
+              │    pop results from session.state
+              │    build_context_blocks() → numbered [N] evidence blocks
+              │    context.extend_instructions() → appended to system prompt
+              │
+              └─ AzureOpenAIChatClient                  ← Azure OpenAI (managed identity)
+                   azure_ad_token_provider=get_bearer_token_provider(
+                       DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+                   streams tokens → update.text
+```
+
+---
+
+## Microsoft Agent Framework SDK Primitives
+
+| Primitive | Where used | Purpose |
+|-----------|-----------|---------|
+| `AzureOpenAIChatClient` | `llm/af_agent_factory.py` | Azure OpenAI client with managed identity |
+| `client.as_agent()` | `llm/af_agent_factory.py` | Creates a ChatAgent with system prompt + providers |
+| `BaseContextProvider` | `agent_runtime/af_rag_context_provider.py` | RAG context injection hook |
+| `context.extend_instructions()` | `agent_runtime/af_rag_context_provider.py` | Appends retrieved chunks to system prompt |
+| `InMemoryHistoryProvider` | `llm/af_agent_factory.py` | Optional multi-turn history (ENABLE_IN_MEMORY_HISTORY) |
+| `AgentSession` (AF) | `agent_runtime/agent.py` | SDK session carrying history + provider state |
+| `af_agent.create_session()` | `agent_runtime/agent.py` | Creates a fresh AF session per request |
+| `af_agent.run(stream=True)` | `agent_runtime/agent.py` | Streams tokens as `update.text` |
+
+**Key distinction from plain FastAPI + custom LLM loop:**
+- RAG context injection is a first-class `BaseContextProvider` hook (`before_run` / `after_run`),
+  not ad-hoc string concatenation inside the orchestrator.
+- Conversation history is managed by `InMemoryHistoryProvider` inside the SDK session state,
+  not by a hand-rolled `_histories` dict.
+- The LLM call, prompt assembly, and context merging are owned by the Agent Framework SDK —
+  `AgentRuntime` only needs to populate `session.state` and call `af_agent.run()`.
+
+---
+
 ## Project Structure
 
 ```
 pseg-techman-chat-backend/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                   # FastAPI app, CORS middleware, lifespan
+│   ├── main.py                              # FastAPI app, CORS, lifespan
 │   ├── config/
-│   │   ├── __init__.py
-│   │   └── settings.py           # All configuration from env vars (no secrets)
+│   │   └── settings.py                      # All env vars — no API keys
 │   ├── api/
-│   │   ├── __init__.py
-│   │   ├── routes.py             # POST /chat, POST /chat/stream
-│   │   └── schemas.py            # ChatRequest, ChatResponse, Citation
-│   └── services/
-│       ├── __init__.py
-│       ├── credentials.py        # DefaultAzureCredential singleton
-│       ├── embeddings.py         # Azure OpenAI Ada-002 embeddings (Managed Identity)
-│       ├── search.py             # Hybrid Azure AI Search retrieval pipeline
-│       ├── chat.py               # Azure OpenAI chat completion (streaming + non-streaming)
-│       ├── citations.py          # Citation deduplication and formatting
-│       └── prompts.py            # System prompt and context block formatter
+│   │   ├── routes.py                        # POST /chat, POST /chat/stream (thin)
+│   │   └── schemas.py                       # ChatRequest, ChatResponse, Citation
+│   ├── agent_runtime/
+│   │   ├── agent.py                         # AgentRuntime — AF SDK orchestrator
+│   │   ├── session.py                       # AgentSession — per-request state
+│   │   ├── af_rag_context_provider.py       # RagContextProvider(BaseContextProvider)
+│   │   ├── context_providers.py             # build_context_blocks formatter
+│   │   ├── citation_provider.py             # build_citations deduplicator
+│   │   └── prompts.py                       # SYSTEM_PROMPT + CLARIFYING_RESPONSE
+│   ├── tools/
+│   │   └── retrieval_tool.py                # Hybrid Azure AI Search (managed identity)
+│   └── llm/
+│       ├── credentials.py                   # DefaultAzureCredential + token provider
+│       ├── aoai_embeddings.py               # Query embeddings (managed identity)
+│       └── af_agent_factory.py              # AzureOpenAIChatClient + as_agent()
 ├── requirements.txt
-├── .env.example                  # Template — no secrets
-├── .gitignore
+├── .env.example
 └── README.md
 ```
 
@@ -44,11 +111,11 @@ pseg-techman-chat-backend/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness check — returns `{"status": "ok"}` |
-| `POST` | `/chat` | **Non-streaming JSON** — primary integration endpoint for Power Apps / PCF |
-| `POST` | `/chat/stream` | Streaming Server-Sent Events (SSE) — for live token display |
-| `GET` | `/docs` | Swagger UI (interactive API docs) |
-| `GET` | `/redoc` | ReDoc API docs |
+| `GET` | `/health` | Liveness check — `{"status": "ok"}` |
+| `POST` | `/chat` | **Non-streaming JSON** — primary endpoint for Power Apps / PCF |
+| `POST` | `/chat/stream` | Streaming SSE — live token display |
+| `GET` | `/docs` | Swagger UI |
+| `GET` | `/redoc` | ReDoc docs |
 
 ### POST /chat — Request
 
@@ -63,7 +130,7 @@ pseg-techman-chat-backend/
 
 ```json
 {
-  "answer": "According to the manual [1], the pressure test procedure requires...\n\nSources:\n- gas_service_manual.pdf",
+  "answer": "According to the manual [1], the pressure test requires...\n\nSources:\n- gas_service_manual.pdf",
   "citations": [
     {
       "source": "gas_service_manual.pdf",
@@ -78,23 +145,23 @@ pseg-techman-chat-backend/
 }
 ```
 
-### POST /chat — HTTP Responses
+### POST /chat — HTTP Status Codes
 
 | Status | Condition |
 |--------|-----------|
 | `200` | Success — answer and citations returned |
-| `200` | Gate rejection — `answer` contains a clarifying question, `citations: []` |
-| `422` | Request body validation failed (e.g. missing `question`) |
+| `200` | Gate rejection — `answer` is a clarifying question, `citations: []` |
+| `422` | Request body validation error (e.g. missing `question`) |
 | `502` | Azure AI Search retrieval failed |
 | `502` | Azure OpenAI generation failed |
 
-### POST /chat/stream — SSE Event Types
+### POST /chat/stream — SSE Event Contract
 
 | Event | Content |
 |-------|---------|
 | `data: <token>` (unnamed) | Answer token — accumulate to build the full answer |
-| `event: citations` | `CitationsPayload` JSON — always emitted after the last token on success |
-| `event: error` | `{"error": "..."}` JSON — emitted if retrieval or generation fails, then `[DONE]` |
+| `event: citations` | `CitationsPayload` JSON — always emitted after the last token |
+| `event: error` | `{"error": "..."}` — emitted on failure, then `[DONE]` |
 | `event: ping` | Keepalive heartbeat — ignore |
 | `data: [DONE]` | Stream end sentinel |
 
@@ -102,10 +169,9 @@ pseg-techman-chat-backend/
 
 **Citations are always derived from retrieval results — never from LLM answer text.**
 
-- Citations are built immediately after retrieval succeeds and the gate passes.
-- They are returned regardless of whether the LLM includes `[1]` or `Sources:` in its answer.
-- This makes the citation output stable and predictable for downstream integrations.
-- Inline citation markers in the answer (e.g. `[1]`) are for reader convenience only.
+- Built from Azure AI Search results immediately after the gate passes.
+- Returned regardless of whether the LLM includes `[1]` or `Sources:` in its answer.
+- Stable and predictable output for downstream Power Apps / PCF integrations.
 
 ---
 
@@ -114,45 +180,41 @@ pseg-techman-chat-backend/
 ### Prerequisites
 
 - Python 3.11+
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and signed in (`az login`)
-- Access to the Azure OpenAI and Azure AI Search resources with the RBAC roles listed below
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) signed in (`az login`)
+- Access to Azure OpenAI and Azure AI Search with the RBAC roles listed below
 
 ### Steps
 
 ```bash
-# 1. Clone the repository
+# 1. Clone
 git clone https://github.com/srikanthot/pseg-techman-chat-backend.git
 cd pseg-techman-chat-backend
 
-# 2. Create and activate a virtual environment
+# 2. Virtual environment
 python -m venv .venv
-# Windows (Git Bash):
-source .venv/Scripts/activate
-# macOS / Linux:
-source .venv/bin/activate
+source .venv/Scripts/activate   # Windows Git Bash
+# source .venv/bin/activate     # macOS / Linux
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment variables
+# 4. Configure
 cp .env.example .env
-# Edit .env — fill in AZURE_OPENAI_ENDPOINT, AZURE_SEARCH_ENDPOINT, etc.
-# Do NOT add API keys — leave authentication to Managed Identity.
+# Edit .env — fill in AZURE_OPENAI_ENDPOINT, AZURE_SEARCH_ENDPOINT, deployment names.
+# Do NOT add API keys.
 
-# 5. Log in to Azure (required for local DefaultAzureCredential)
+# 5. Azure login (local DefaultAzureCredential)
 az login
 
-# 6. Start the development server
+# 6. Start
 uvicorn app.main:app --reload --port 8000
 ```
 
-Open http://localhost:8000/docs to explore the API interactively.
+Open http://localhost:8000/docs for interactive API docs.
 
 ---
 
 ## Environment Variables
-
-All non-secret configuration. **No API keys required.**
 
 ### Azure OpenAI
 
@@ -161,8 +223,9 @@ All non-secret configuration. **No API keys required.**
 | `AZURE_OPENAI_ENDPOINT` | Yes | — | Azure OpenAI resource endpoint |
 | `AZURE_OPENAI_API_VERSION` | No | `2024-06-01` | API version |
 | `AZURE_OPENAI_CHAT_DEPLOYMENT` | Yes | — | Chat model deployment name |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` | No | same as above | Agent Framework SDK alias — keep in sync |
 | `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT` | Yes | — | Embeddings deployment name |
-| `AZURE_OPENAI_TOKEN_SCOPE` | No | `https://cognitiveservices.azure.com/.default` | Override for GCC High: `https://cognitiveservices.azure.us/.default` |
+| `AZURE_OPENAI_TOKEN_SCOPE` | No | `https://cognitiveservices.azure.com/.default` | GCC High: `https://cognitiveservices.azure.us/.default` |
 
 ### Azure AI Search
 
@@ -175,83 +238,66 @@ All non-secret configuration. **No API keys required.**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated list of allowed origins. The default covers local development. **Always override in production** with your actual Power Apps / PCF domains. |
-
-**How CORS is implemented:**
-
-`ALLOWED_ORIGINS` is always a list of explicit origins — never a wildcard.
-`allow_credentials=True` is always set, which is valid because:
-- The CORS spec forbids combining `allow_origins=["*"]` with `allow_credentials=True`.
-- An explicit origin list avoids this entirely — specific origins + credentials is valid.
-
-Example for production:
-```
-ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.crm.dynamics.com
-```
+| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated allowed origins. **Always override in production.** |
 
 ### Index Field Mappings
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SEARCH_CONTENT_FIELD` | `chunk` | Primary content field sent to LLM |
-| `SEARCH_SEMANTIC_CONTENT_FIELD` | `chunk_for_semantic` | Field used by semantic reranker |
-| `SEARCH_VECTOR_FIELD` | `text_vector` | Vector field for nearest-neighbor search |
-| `SEARCH_FILENAME_FIELD` | `source_file` | Source document filename |
-| `SEARCH_URL_FIELD` | `source_url` | Blob storage URL |
-| `SEARCH_CHUNK_ID_FIELD` | `chunk_id` | Unique chunk identifier |
-| `SEARCH_TITLE_FIELD` | `title` | Document title |
-| `SEARCH_SECTION1_FIELD` | `header_1` | Top-level section heading |
-| `SEARCH_SECTION2_FIELD` | `header_2` | Sub-section heading |
-| `SEARCH_SECTION3_FIELD` | `header_3` | Sub-sub-section heading |
-| `SEARCH_PAGE_FIELD` | *(blank)* | Page number field — leave blank if not in index |
+| Variable | Default |
+|----------|---------|
+| `SEARCH_CONTENT_FIELD` | `chunk` |
+| `SEARCH_SEMANTIC_CONTENT_FIELD` | `chunk_for_semantic` |
+| `SEARCH_VECTOR_FIELD` | `text_vector` |
+| `SEARCH_FILENAME_FIELD` | `source_file` |
+| `SEARCH_URL_FIELD` | `source_url` |
+| `SEARCH_CHUNK_ID_FIELD` | `chunk_id` |
+| `SEARCH_TITLE_FIELD` | `title` |
+| `SEARCH_SECTION1_FIELD` | `header_1` |
+| `SEARCH_SECTION2_FIELD` | `header_2` |
+| `SEARCH_SECTION3_FIELD` | `header_3` |
+| `SEARCH_PAGE_FIELD` | *(blank)* |
 
 ### Retrieval Tuning
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOP_K` | `5` | Maximum chunks returned after all filtering |
-| `RETRIEVAL_CANDIDATES` | `15` | Raw candidates fetched from Azure Search |
-| `VECTOR_K` | `50` | Nearest-neighbor count for vector query |
-| `USE_SEMANTIC_RERANKER` | `true` | Enable semantic reranker (requires semantic config in index) |
-| `SEMANTIC_CONFIG_NAME` | `manual-semantic-config` | Semantic configuration name in the index |
+| `TOP_K` | `5` | Max chunks after all filters |
+| `RETRIEVAL_CANDIDATES` | `15` | Raw pool fetched from Azure Search |
+| `VECTOR_K` | `50` | kNN neighbours for vector query |
+| `USE_SEMANTIC_RERANKER` | `true` | Enable semantic reranker |
+| `SEMANTIC_CONFIG_NAME` | `manual-semantic-config` | Semantic config name in the index |
 | `QUERY_LANGUAGE` | `en-us` | Query language for semantic search |
 
 ### Confidence Gate
 
-The gate evaluates the **top chunk's score** (not the average), making it practical for
-technical manual Q&A where a single excellent chunk should produce a good answer.
+Score-first evaluation — a single highly relevant chunk passes on its own.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIN_RESULTS` | `1` | Minimum chunks required. Default is 1 — one relevant chunk is sufficient. Do not hard-fail just because fewer than 2 chunks were retrieved. |
-| `MIN_AVG_SCORE` | `0.01` | Gate threshold for the top chunk's base RRF/hybrid score (range 0.01–0.033). |
-| `MIN_RERANKER_SCORE` | `0.2` | Gate threshold for the top chunk's reranker score (range 0–4). Applied when `USE_SEMANTIC_RERANKER=true`. |
-
-**Gate outcomes:**
-- Pass → proceed to generation, return citations built from retrieval.
-- Fail → return HTTP 200 with a clarifying question and `citations: []` (not a server error).
+| `MIN_RESULTS` | `1` | Secondary count guard (consulted only when top score also fails) |
+| `MIN_AVG_SCORE` | `0.01` | Top chunk threshold for base RRF/hybrid score |
+| `MIN_RERANKER_SCORE` | `0.2` | Top chunk threshold for semantic reranker score |
 
 ### Diversity Filtering
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DIVERSITY_BY_SOURCE` | `true` | Enable per-source diversity capping |
-| `MAX_CHUNKS_PER_SOURCE` | `2` | Standard cap: max chunks from any single source |
-| `DOMINANT_SOURCE_SCORE_RATIO` | `1.5` | Score ratio to detect a dominant source |
-| `MAX_CHUNKS_DOMINANT_SOURCE` | `4` | Relaxed cap for the dominant source |
-| `SCORE_GAP_MIN_RATIO` | `0.55` | Discard chunks scoring below this fraction of the top score |
+| `DIVERSITY_BY_SOURCE` | `true` | Enable per-source diversity cap |
+| `MAX_CHUNKS_PER_SOURCE` | `2` | Standard cap per source |
+| `DOMINANT_SOURCE_SCORE_RATIO` | `1.5` | Score ratio to detect dominant source |
+| `MAX_CHUNKS_DOMINANT_SOURCE` | `4` | Cap for dominant source |
+| `SCORE_GAP_MIN_RATIO` | `0.55` | Drop chunks below this fraction of top score |
 
 ### Session History
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENABLE_IN_MEMORY_HISTORY` | `false` | **Disabled by default — the backend is stateless.** This is safe for App Service scale-out (instances don't share memory) and restarts (no silent data loss). Set to `true` only for single-instance local dev or demos. |
+| `ENABLE_IN_MEMORY_HISTORY` | `false` | **Disabled by default (stateless).** Set `true` to enable Agent Framework `InMemoryHistoryProvider` for local dev multi-turn demos. Not suitable for production (lost on restart/scale-out). |
 
 ### Debug
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRACE_MODE` | `false` | Log detailed retrieval trace (scores, sections, content previews) |
+| `TRACE_MODE` | `false` | Log retrieval scores, injected context blocks, diversity decisions |
 
 ---
 
@@ -263,20 +309,18 @@ technical manual Q&A where a single excellent chunk should produce a good answer
 gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 app.main:app
 ```
 
-Worker count guidance: `2` for B2/B3 plans, `4` for P2v3/P3v3. Do not exceed `2 × CPU + 1`.
+Worker count: `2` for B2/B3 plans, `4` for P2v3/P3v3.
 
-### App Service Configuration
+### Configuration
 
-1. **Runtime stack:** Python 3.11
-2. **Operating system:** Linux
-3. **Startup command:** (see above)
-4. **App Settings:** Add all variables from `.env.example` — remember to override `ALLOWED_ORIGINS` with your production domains.
-5. **System-assigned managed identity:** Enable under Identity → System assigned.
+1. **Runtime stack:** Python 3.11, Linux
+2. **Startup command:** (see above)
+3. **App Settings:** add all variables from `.env.example`; override `ALLOWED_ORIGINS`
+4. **System-assigned managed identity:** Identity → System assigned → On
 
-### Deployment
+### Deploy
 
 ```bash
-# ZIP deploy via Azure CLI
 az webapp deploy \
   --resource-group <rg> \
   --name <app-name> \
@@ -286,83 +330,36 @@ az webapp deploy \
 
 ---
 
-## Managed Identity RBAC Requirements
+## Managed Identity RBAC
 
-Enable **system-assigned managed identity** on the App Service, then assign these roles.
+Enable **system-assigned managed identity** and assign:
 
-### For your local development user (`az login` identity)
-
-| Azure Resource | Role | Scope |
-|----------------|------|-------|
-| Azure OpenAI resource | **Cognitive Services OpenAI User** | The OpenAI resource |
-| Azure AI Search resource | **Search Index Data Reader** | The Search resource |
-
-### For the Azure App Service managed identity
-
-| Azure Resource | Role | Scope |
-|----------------|------|-------|
-| Azure OpenAI resource | **Cognitive Services OpenAI User** | The OpenAI resource |
-| Azure AI Search resource | **Search Index Data Reader** | The Search resource |
-
-### Assigning roles via Azure CLI
+| Azure Resource | Role | Used by |
+|----------------|------|---------|
+| Azure OpenAI resource | **Cognitive Services OpenAI User** | AzureOpenAIChatClient (chat) + AzureOpenAI (embeddings) |
+| Azure AI Search resource | **Search Index Data Reader** | SearchClient (retrieval) |
 
 ```bash
-# Get the managed identity's principal ID
 PRINCIPAL_ID=$(az webapp identity show \
-  --name <app-name> \
-  --resource-group <rg> \
-  --query principalId -o tsv)
+  --name <app-name> --resource-group <rg> --query principalId -o tsv)
 
-# OpenAI role
-az role assignment create \
-  --assignee $PRINCIPAL_ID \
+az role assignment create --assignee $PRINCIPAL_ID \
   --role "Cognitive Services OpenAI User" \
   --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<openai-resource>
 
-# Search role
-az role assignment create \
-  --assignee $PRINCIPAL_ID \
+az role assignment create --assignee $PRINCIPAL_ID \
   --role "Search Index Data Reader" \
   --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Search/searchServices/<search-resource>
 ```
 
-> Role assignments can take up to 5 minutes to propagate.
+> Role assignments take up to 5 minutes to propagate.
 
 ---
 
-## Retrieval Pipeline
-
-```
-POST /chat (or /chat/stream)
-  │
-  ├─ 1.  Distil keyword query (strip conversational filler → better BM25)
-  ├─ 2.  Generate query embedding via Azure OpenAI Ada-002
-  ├─ 3.  Hybrid search: BM25 + VectorizedQuery → RETRIEVAL_CANDIDATES results
-  ├─ 4.  Optional semantic reranking (USE_SEMANTIC_RERANKER=true)
-  ├─ 5.  Normalise → canonical result schema, sorted by effective score
-  ├─ 6.  Filter Table-of-Contents / index pages
-  ├─ 7.  Adaptive diversity cap (per-source cap, dominant-source relaxation)
-  ├─ 8.  Score-gap filter (drop bottom fraction by score ratio)
-  ├─ 9.  Trim to TOP_K
-  ├─ 10. Confidence gate — evaluates TOP chunk score (not average):
-  │        MIN_RESULTS=1: one strong chunk is sufficient
-  │        Gate fail → 200 with clarifying question, citations=[]
-  ├─ 11. Build citations from retrieval results
-  │        Always from retrieval — never from LLM answer text
-  ├─ 12. Azure OpenAI chat completion (non-streaming or streaming)
-  │        Failure → HTTP 502 (JSON) or event: error (SSE)
-  └─ 13. Return ChatResponse{answer, citations, session_id}
-```
-
----
-
-## GCC High (Azure Government) Notes
-
-Set this variable to point to the Government cognitive services endpoint:
+## GCC High (Azure Government)
 
 ```
 AZURE_OPENAI_TOKEN_SCOPE=https://cognitiveservices.azure.us/.default
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.us/
+AZURE_SEARCH_ENDPOINT=https://<search>.search.azure.us
 ```
-
-All Azure SDK clients (`azure-identity`, `azure-search-documents`, `openai`) support
-Azure Government endpoints when the correct endpoint URL is provided.

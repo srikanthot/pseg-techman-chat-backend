@@ -1,6 +1,13 @@
 """
-System prompt, context formatting, and fallback responses for the
-PSEG Tech Manual Chat Backend.
+Prompt templates and fallback responses for the PSEG Tech Manual Agent.
+
+SYSTEM_PROMPT  — bound to the ChatAgent at creation time via as_agent(instructions=...).
+                 Enforces strict citation grounding: the model must answer ONLY
+                 from the numbered [N] context blocks injected by RagContextProvider.
+
+CLARIFYING_RESPONSE — returned to the user (200 OK) when the confidence gate
+                      rejects the retrieval results as insufficient evidence.
+                      Not an error — a polite request for more information.
 """
 
 SYSTEM_PROMPT = """\
@@ -31,26 +38,3 @@ CLARIFYING_RESPONSE = (
     "Could you provide more details, such as the equipment type, model number, or the specific "
     "procedure you're looking for?"
 )
-
-
-def _section_path(r: dict) -> str:
-    """Build a human-readable breadcrumb from the header fields."""
-    parts = [r.get("section1", ""), r.get("section2", ""), r.get("section3", "")]
-    return " > ".join(p for p in parts if p)
-
-
-def build_context_blocks(results: list[dict]) -> str:
-    """Format retrieved chunks into numbered evidence blocks for the LLM."""
-    blocks = []
-    for i, r in enumerate(results, 1):
-        section = _section_path(r)
-        block = (
-            f"[{i}]\n"
-            f"Title: {r.get('title', '')}\n"
-            f"Source: {r.get('source', '')}\n"
-            f"Section: {section}\n"
-            f"URL: {r.get('url', '')}\n"
-            f"Content:\n{r.get('content', '')}"
-        )
-        blocks.append(block)
-    return "\n\n---\n\n".join(blocks)
