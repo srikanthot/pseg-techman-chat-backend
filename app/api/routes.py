@@ -2,7 +2,7 @@
 API route handlers for the PSEG Tech Manual Chat Backend.
 
 Endpoints:
-  GET  /health          — liveness check
+  GET  /health          — liveness check (defined in main.py)
   POST /chat            — non-streaming JSON response (primary integration endpoint)
   POST /chat/stream     — Server-Sent Events streaming response
 """
@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas import ChatRequest, ChatResponse, CitationsPayload
@@ -40,35 +40,47 @@ _PING_INTERVAL_SECS = 20  # keepalive ping interval for SSE connections
 def _check_gate(results: list[dict]) -> tuple[bool, str]:
     """Return (passed, rejection_reason).
 
-    Gate rejects if:
-    - fewer chunks than MIN_RESULTS were retrieved, OR
-    - average effective score falls below the configured threshold.
+    Gate logic (practical for technical manual Q&A):
+    - Reject if fewer than MIN_RESULTS chunks were retrieved (default 1).
+      A single highly relevant chunk is sufficient — do not require multiple
+      results when one strong match exists.
+    - Check the TOP chunk's score against the configured threshold.
+      Using the top score (not the average) avoids penalising responses when
+      one excellent chunk is accompanied by lower-scoring supporting chunks.
     """
     if len(results) < MIN_RESULTS:
-        return False, f"only {len(results)} chunks retrieved (minimum {MIN_RESULTS})"
+        return False, f"retrieved {len(results)} chunk(s) (minimum {MIN_RESULTS})"
 
-    if USE_SEMANTIC_RERANKER:
-        reranker_scores = [
-            r["reranker_score"]
-            for r in results
-            if r.get("reranker_score") is not None
-        ]
-        if reranker_scores:
-            avg = sum(reranker_scores) / len(reranker_scores)
-            if avg < MIN_RERANKER_SCORE:
-                return False, f"avg reranker score {avg:.3f} < threshold {MIN_RERANKER_SCORE}"
-            return True, ""
+    # results are pre-sorted by effective score descending
+    top = results[0]
 
-    # Fall back to base score gate
-    avg = sum(r["score"] for r in results) / len(results)
-    if avg < MIN_AVG_SCORE:
-        return False, f"avg score {avg:.4f} < threshold {MIN_AVG_SCORE}"
+    if USE_SEMANTIC_RERANKER and top.get("reranker_score") is not None:
+        top_score = top["reranker_score"]
+        if top_score < MIN_RERANKER_SCORE:
+            return (
+                False,
+                f"top reranker score {top_score:.3f} < threshold {MIN_RERANKER_SCORE}",
+            )
+        return True, ""
+
+    # Fall back to base RRF / hybrid score
+    top_score = top["score"]
+    if top_score < MIN_AVG_SCORE:
+        return False, f"top score {top_score:.4f} < threshold {MIN_AVG_SCORE}"
     return True, ""
 
 
-def _has_inline_citations(answer: str) -> bool:
-    """Return True if the LLM used inline citation markers."""
-    return "Sources:" in answer or "[1]" in answer
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+
+def _sse_data(text: str) -> bytes:
+    """Encode a token as an SSE data line, escaping embedded newlines."""
+    escaped = text.replace("\n", "\\n")
+    return f"data: {escaped}\n\n".encode("utf-8")
+
+
+def _sse_event(event: str, data: str) -> bytes:
+    """Encode a named SSE event."""
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
 
 
 # ── POST /chat (non-streaming, JSON) ─────────────────────────────────────────
@@ -80,7 +92,9 @@ def _has_inline_citations(answer: str) -> bool:
     description=(
         "Submit a question and receive a complete JSON response with the answer "
         "and structured citations. This is the recommended endpoint for Power Apps "
-        "and PCF integrations."
+        "and PCF integrations.\n\n"
+        "Citations are always returned based on retrieval results — they are not "
+        "dependent on the LLM's answer formatting."
     ),
     tags=["chat"],
 )
@@ -96,36 +110,38 @@ async def chat(request: ChatRequest) -> ChatResponse:
     try:
         results = await asyncio.to_thread(search_service.retrieve, request.question)
     except Exception as exc:
-        logger.exception("Retrieval error: %s", exc)
-        return ChatResponse(
-            answer="I encountered an error retrieving information from the manuals. Please try again.",
-            citations=[],
-            session_id=session_id,
+        logger.exception("Retrieval error for session=%s: %s", session_id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to retrieve information from Azure AI Search. Please try again.",
         )
 
     # ── Confidence gate ───────────────────────────────────────────────────────
     passed, reason = _check_gate(results)
     if not passed:
-        logger.info("Gate rejected: %s", reason)
+        logger.info("Gate rejected session=%s reason=%s", session_id, reason)
+        # Gate rejection is a valid application outcome, not an error —
+        # return 200 with a clarifying message and empty citations.
         return ChatResponse(
             answer=CLARIFYING_RESPONSE,
             citations=[],
             session_id=session_id,
         )
 
+    # ── Build citations from retrieval results ────────────────────────────────
+    # Citations are always derived from what was retrieved, never from the
+    # LLM's answer text. This makes citation output stable and reliable.
+    citations = build_citations(results)
+
     # ── Generate ──────────────────────────────────────────────────────────────
     try:
         answer = await chat_service.complete(session_id, request.question, results)
     except Exception as exc:
-        logger.exception("Chat completion error: %s", exc)
-        return ChatResponse(
-            answer="I encountered an error generating a response. Please try again.",
-            citations=[],
-            session_id=session_id,
+        logger.exception("Chat completion error for session=%s: %s", session_id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to generate a response from Azure OpenAI. Please try again.",
         )
-
-    # ── Build citations ───────────────────────────────────────────────────────
-    citations = build_citations(results) if _has_inline_citations(answer) else []
 
     return ChatResponse(
         answer=answer,
@@ -136,68 +152,67 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 # ── POST /chat/stream (SSE streaming) ────────────────────────────────────────
 
-def _sse_data(text: str) -> bytes:
-    """Encode a token as an SSE data line, escaping embedded newlines."""
-    escaped = text.replace("\n", "\\n")
-    return f"data: {escaped}\n\n".encode("utf-8")
-
-
-def _sse_event(event: str, data: str) -> bytes:
-    """Encode a named SSE event."""
-    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
-
-
 async def _stream_generator(
     session_id: str,
     question: str,
 ) -> AsyncGenerator[bytes, None]:
-    """Internal SSE generator: retrieve → gate → stream tokens → citations → DONE."""
+    """Internal SSE generator: retrieve → gate → stream tokens → citations → DONE.
+
+    SSE error handling: unlike the JSON endpoint, we cannot raise HTTPException
+    after the response stream has started. Errors are emitted as named SSE events
+    so the client can distinguish them from answer tokens.
+    """
 
     # ── Retrieve ──────────────────────────────────────────────────────────────
     try:
         results = await asyncio.to_thread(search_service.retrieve, question)
     except Exception as exc:
-        logger.exception("Retrieval error: %s", exc)
-        yield _sse_data(
-            "I encountered an error retrieving information from the manuals. Please try again."
+        logger.exception("Retrieval error for session=%s: %s", session_id, exc)
+        yield _sse_event(
+            "error",
+            json.dumps({"error": "Retrieval failed. Please try again."}),
         )
-        yield _sse_event("citations", json.dumps({"citations": []}))
         yield _sse_data("[DONE]")
         return
 
     # ── Confidence gate ───────────────────────────────────────────────────────
     passed, reason = _check_gate(results)
     if not passed:
-        logger.info("Gate rejected: %s", reason)
+        logger.info("Gate rejected session=%s reason=%s", session_id, reason)
         yield _sse_data(CLARIFYING_RESPONSE)
         yield _sse_event("citations", json.dumps({"citations": []}))
         yield _sse_data("[DONE]")
         return
 
+    # ── Build citations from retrieval results ────────────────────────────────
+    # Computed from retrieval — not dependent on LLM answer format.
+    citations = build_citations(results)
+    citations_payload = CitationsPayload(citations=citations)
+
     # ── Stream tokens ─────────────────────────────────────────────────────────
-    answer_buf: list[str] = []
     last_ping = time.monotonic()
 
     try:
         async for token in chat_service.stream_complete(session_id, question, results):
-            answer_buf.append(token)
             yield _sse_data(token)
 
-            # Keepalive ping to prevent proxy/load-balancer timeouts
+            # Keepalive ping to prevent proxy / load-balancer timeouts
             now = time.monotonic()
             if now - last_ping >= _PING_INTERVAL_SECS:
                 yield _sse_event("ping", "keepalive")
                 last_ping = now
 
     except Exception as exc:
-        logger.exception("Streaming error: %s", exc)
-        yield _sse_data("\n\nI encountered an error while generating the response.")
+        logger.exception("Streaming error for session=%s: %s", session_id, exc)
+        yield _sse_event(
+            "error",
+            json.dumps({"error": "Generation failed. Please try again."}),
+        )
+        yield _sse_data("[DONE]")
+        return
 
     # ── Citations ─────────────────────────────────────────────────────────────
-    answer = "".join(answer_buf)
-    citations = build_citations(results) if _has_inline_citations(answer) else []
-    payload = CitationsPayload(citations=citations)
-    yield _sse_event("citations", payload.model_dump_json())
+    yield _sse_event("citations", citations_payload.model_dump_json())
     yield _sse_data("[DONE]")
 
 
@@ -206,8 +221,12 @@ async def _stream_generator(
     summary="Streaming chat (SSE)",
     description=(
         "Submit a question and receive a streaming Server-Sent Events response. "
-        "Tokens are streamed as they are generated. A 'citations' named event is "
-        "emitted at the end, followed by a [DONE] sentinel."
+        "Tokens are streamed as they are generated. Named events:\n\n"
+        "- `event: citations` — structured citations JSON, emitted after the last token\n"
+        "- `event: error` — error JSON if retrieval or generation fails\n"
+        "- `event: ping` — keepalive, ignore\n"
+        "- `data: [DONE]` — stream end sentinel\n\n"
+        "Citations are always based on retrieval results, not answer formatting."
     ),
     tags=["chat"],
 )
