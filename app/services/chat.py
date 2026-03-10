@@ -4,12 +4,15 @@ Azure OpenAI chat completion using Managed Identity.
 Uses AsyncAzureOpenAI so both the streaming and non-streaming paths are
 fully async — no thread-pool blocking in the event loop.
 
+Authentication: azure_ad_token_provider (DefaultAzureCredential).
+No API keys are used or read anywhere in this module.
+
 Conversation history:
   Disabled by default (ENABLE_IN_MEMORY_HISTORY=false).
   The backend is stateless by default, which is safe for App Service
-  scale-out and restarts. Enable history only for single-instance
-  development or when loss of history on restart is acceptable.
-  When disabled, every request is independent (stateless mode).
+  scale-out (multiple instances do not share memory) and restarts
+  (history would silently reset). Enable only for single-instance
+  local development or demos where losing history on restart is acceptable.
 """
 
 import logging
@@ -28,15 +31,15 @@ from app.services.prompts import SYSTEM_PROMPT, build_context_blocks
 
 logger = logging.getLogger(__name__)
 
-# Lazy-initialised singleton async client
+# Lazy-initialised singleton — one client shared across all requests
 _async_client: AsyncAzureOpenAI | None = None
 
 # In-memory conversation history: session_id → list[{role, content}]
 # Only populated when ENABLE_IN_MEMORY_HISTORY=true.
-# Scoped to a single process instance — resets on restart or scale-out.
+# Scoped to this process instance — resets on restart or scale-out.
 _histories: dict[str, list[dict]] = {}
 
-_MAX_HISTORY_MESSAGES = 20  # 10 turns (user + assistant per turn)
+_MAX_HISTORY_MESSAGES = 20  # 10 turns (1 user + 1 assistant message per turn)
 
 
 def _get_client() -> AsyncAzureOpenAI:
@@ -48,8 +51,7 @@ def _get_client() -> AsyncAzureOpenAI:
             api_version=AZURE_OPENAI_API_VERSION,
         )
         logger.info(
-            "AsyncAzureOpenAI (chat) initialised: endpoint=%s deployment=%s "
-            "history=%s",
+            "AsyncAzureOpenAI (chat) initialised: endpoint=%s deployment=%s history=%s",
             AZURE_OPENAI_ENDPOINT,
             AZURE_OPENAI_CHAT_DEPLOYMENT,
             "enabled" if ENABLE_IN_MEMORY_HISTORY else "disabled (stateless)",
@@ -58,29 +60,37 @@ def _get_client() -> AsyncAzureOpenAI:
 
 
 def _get_history(session_id: str) -> list[dict]:
-    """Return the conversation history for this session, or [] if disabled."""
+    """Return the conversation history for this session.
+
+    Returns an empty list when ENABLE_IN_MEMORY_HISTORY=false (stateless mode),
+    so that every request is treated as a fresh conversation.
+    """
     if not ENABLE_IN_MEMORY_HISTORY:
         return []
     return _histories.get(session_id, [])
 
 
 def _save_turn(session_id: str, question: str, answer: str) -> None:
-    """Persist the user/assistant turn. No-op when history is disabled."""
+    """Append the user/assistant turn to history.
+
+    No-op when ENABLE_IN_MEMORY_HISTORY=false — in stateless mode nothing is
+    stored and the dict stays empty.
+    """
     if not ENABLE_IN_MEMORY_HISTORY:
         return
     if session_id not in _histories:
         _histories[session_id] = []
     _histories[session_id].append({"role": "user", "content": question})
     _histories[session_id].append({"role": "assistant", "content": answer})
-    # Trim to keep memory bounded
+    # Keep memory bounded — trim to the most recent N messages
     _histories[session_id] = _histories[session_id][-_MAX_HISTORY_MESSAGES:]
 
 
 def _build_messages(session_id: str, question: str, context_blocks: str) -> list[dict]:
     """Assemble the full messages list for this turn.
 
-    History is only included when ENABLE_IN_MEMORY_HISTORY=true.
-    In stateless mode the list is simply [system, user].
+    When history is disabled (stateless mode): [system, user].
+    When history is enabled:                   [system, ...history..., user].
     """
     history = _get_history(session_id)
     user_content = (
@@ -101,7 +111,7 @@ async def complete(session_id: str, question: str, results: list[dict]) -> str:
     """Non-streaming chat completion. Returns the full answer string.
 
     Raises on Azure OpenAI failure — the route handler converts this to
-    an appropriate HTTPException.
+    an HTTP 502 response.
     """
     context_blocks = build_context_blocks(results)
     messages = _build_messages(session_id, question, context_blocks)
@@ -125,8 +135,8 @@ async def stream_complete(
 ) -> AsyncGenerator[str, None]:
     """Streaming chat completion. Yields token strings one at a time.
 
-    Raises on Azure OpenAI failure — the route handler catches this and
-    emits a named SSE error event.
+    Raises on Azure OpenAI failure — the route handler catches this,
+    emits a named SSE error event, and terminates the stream cleanly.
     Conversation history is saved after the full answer is assembled.
     """
     context_blocks = build_context_blocks(results)

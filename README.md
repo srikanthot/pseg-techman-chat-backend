@@ -16,7 +16,7 @@ Designed to be hosted on **Azure App Service on Linux** and consumed by a
 pseg-techman-chat-backend/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                   # FastAPI app, CORS, lifespan
+│   ├── main.py                   # FastAPI app, CORS middleware, lifespan
 │   ├── config/
 │   │   ├── __init__.py
 │   │   └── settings.py           # All configuration from env vars (no secrets)
@@ -27,7 +27,7 @@ pseg-techman-chat-backend/
 │   └── services/
 │       ├── __init__.py
 │       ├── credentials.py        # DefaultAzureCredential singleton
-│       ├── embeddings.py         # Azure OpenAI embeddings (Managed Identity)
+│       ├── embeddings.py         # Azure OpenAI Ada-002 embeddings (Managed Identity)
 │       ├── search.py             # Hybrid Azure AI Search retrieval pipeline
 │       ├── chat.py               # Azure OpenAI chat completion (streaming + non-streaming)
 │       ├── citations.py          # Citation deduplication and formatting
@@ -78,12 +78,13 @@ pseg-techman-chat-backend/
 }
 ```
 
-### POST /chat — Error Responses
+### POST /chat — HTTP Responses
 
-| Status | When |
-|--------|------|
-| `200` | Success, or gate rejection (clarifying question, `citations: []`) |
-| `422` | Request body validation failed (missing `question`) |
+| Status | Condition |
+|--------|-----------|
+| `200` | Success — answer and citations returned |
+| `200` | Gate rejection — `answer` contains a clarifying question, `citations: []` |
+| `422` | Request body validation failed (e.g. missing `question`) |
 | `502` | Azure AI Search retrieval failed |
 | `502` | Azure OpenAI generation failed |
 
@@ -91,19 +92,20 @@ pseg-techman-chat-backend/
 
 | Event | Content |
 |-------|---------|
-| `data: <token>` (unnamed) | Answer token fragment — accumulate to build the full answer |
-| `event: citations` | JSON `CitationsPayload` — structured sources (always emitted on success) |
-| `event: error` | JSON `{"error": "..."}` — emitted if retrieval or generation fails |
-| `event: ping` | Keepalive — ignore |
+| `data: <token>` (unnamed) | Answer token — accumulate to build the full answer |
+| `event: citations` | `CitationsPayload` JSON — always emitted after the last token on success |
+| `event: error` | `{"error": "..."}` JSON — emitted if retrieval or generation fails, then `[DONE]` |
+| `event: ping` | Keepalive heartbeat — ignore |
 | `data: [DONE]` | Stream end sentinel |
 
 ### Citation contract
 
-**Citations are always derived from retrieval results** — never from the LLM's answer text.
-This means:
-- Structured citations are returned whenever retrieval succeeds and the gate passes, regardless of how the model formats its answer.
-- The citation list is stable and predictable for downstream integrations.
-- Inline `[1]` markers in the answer are a reader convenience, not a gate for citations.
+**Citations are always derived from retrieval results — never from LLM answer text.**
+
+- Citations are built immediately after retrieval succeeds and the gate passes.
+- They are returned regardless of whether the LLM includes `[1]` or `Sources:` in its answer.
+- This makes the citation output stable and predictable for downstream integrations.
+- Inline citation markers in the answer (e.g. `[1]`) are for reader convenience only.
 
 ---
 
@@ -113,7 +115,7 @@ This means:
 
 - Python 3.11+
 - [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and signed in (`az login`)
-- Access to the Azure OpenAI and Azure AI Search resources with the roles listed below
+- Access to the Azure OpenAI and Azure AI Search resources with the RBAC roles listed below
 
 ### Steps
 
@@ -134,8 +136,8 @@ pip install -r requirements.txt
 
 # 4. Configure environment variables
 cp .env.example .env
-# Edit .env — fill in your Azure resource endpoints and index settings.
-# Do NOT add any API keys — leave authentication to Managed Identity.
+# Edit .env — fill in AZURE_OPENAI_ENDPOINT, AZURE_SEARCH_ENDPOINT, etc.
+# Do NOT add API keys — leave authentication to Managed Identity.
 
 # 5. Log in to Azure (required for local DefaultAzureCredential)
 az login
@@ -173,7 +175,19 @@ All non-secret configuration. **No API keys required.**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALLOWED_ORIGINS` | *(blank)* | Comma-separated allowed origins. **Leave blank** for wildcard mode (`["*"]`, credentials=False). Set specific origins to enable credential-bearing requests. See [CORS notes](#cors-notes) below. |
+| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated list of allowed origins. The default covers local development. **Always override in production** with your actual Power Apps / PCF domains. |
+
+**How CORS is implemented:**
+
+`ALLOWED_ORIGINS` is always a list of explicit origins — never a wildcard.
+`allow_credentials=True` is always set, which is valid because:
+- The CORS spec forbids combining `allow_origins=["*"]` with `allow_credentials=True`.
+- An explicit origin list avoids this entirely — specific origins + credentials is valid.
+
+Example for production:
+```
+ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.crm.dynamics.com
+```
 
 ### Index Field Mappings
 
@@ -204,16 +218,18 @@ All non-secret configuration. **No API keys required.**
 
 ### Confidence Gate
 
-The gate evaluates the **top chunk's score** (not the average).
-Using the top score is more practical: one excellent chunk accompanied by weaker supporting chunks should still result in a good answer.
+The gate evaluates the **top chunk's score** (not the average), making it practical for
+technical manual Q&A where a single excellent chunk should produce a good answer.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIN_RESULTS` | `1` | Minimum chunks required. Default 1 — a single relevant chunk is sufficient. Raise to 2+ for stricter environments. |
+| `MIN_RESULTS` | `1` | Minimum chunks required. Default is 1 — one relevant chunk is sufficient. Do not hard-fail just because fewer than 2 chunks were retrieved. |
 | `MIN_AVG_SCORE` | `0.01` | Gate threshold for the top chunk's base RRF/hybrid score (range 0.01–0.033). |
-| `MIN_RERANKER_SCORE` | `0.2` | Gate threshold for the top chunk's reranker score (range 0–4). Used when `USE_SEMANTIC_RERANKER=true`. |
+| `MIN_RERANKER_SCORE` | `0.2` | Gate threshold for the top chunk's reranker score (range 0–4). Applied when `USE_SEMANTIC_RERANKER=true`. |
 
-When the gate rejects: returns HTTP 200 with a clarifying question and `citations: []`.
+**Gate outcomes:**
+- Pass → proceed to generation, return citations built from retrieval.
+- Fail → return HTTP 200 with a clarifying question and `citations: []` (not a server error).
 
 ### Diversity Filtering
 
@@ -229,7 +245,7 @@ When the gate rejects: returns HTTP 200 with a clarifying question and `citation
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENABLE_IN_MEMORY_HISTORY` | `false` | Enable in-memory conversation history per session. **Disabled by default** — the backend is stateless, safe for scale-out and restarts. Enable only for single-instance dev/demo use. |
+| `ENABLE_IN_MEMORY_HISTORY` | `false` | **Disabled by default — the backend is stateless.** This is safe for App Service scale-out (instances don't share memory) and restarts (no silent data loss). Set to `true` only for single-instance local dev or demos. |
 
 ### Debug
 
@@ -239,69 +255,33 @@ When the gate rejects: returns HTTP 200 with a clarifying question and `citation
 
 ---
 
-## CORS Notes
-
-**Why `allow_origins=["*"]` and `allow_credentials=True` cannot coexist:**
-The CORS specification forbids sending credentials (cookies, Authorization headers) when the
-server responds with `Access-Control-Allow-Origin: *`. All modern browsers enforce this —
-they will block the response with a CORS error.
-
-**Default behaviour (`ALLOWED_ORIGINS` blank):**
-- `Access-Control-Allow-Origin: *`
-- `allow_credentials=False`
-- **Suitable for most Power Apps / PCF integrations.** PCF components typically
-  include bearer tokens in the `Authorization` header, which works fine without
-  credential mode since the browser does not treat `Authorization` headers as credentials
-  in the CORS credential sense.
-
-**Specific-origin mode (`ALLOWED_ORIGINS` set):**
-- `Access-Control-Allow-Origin: <your-origins>`
-- `allow_credentials=True`
-- Use when the client sends cookies for session auth, or when your security policy
-  requires explicit origin allowlisting.
-
-Example for Power Apps:
-```
-ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.crm.dynamics.com
-```
-
----
-
 ## Azure App Service Deployment
 
 ### Startup Command
-
-Configure this as the startup command in the Azure App Service configuration:
 
 ```
 gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 app.main:app
 ```
 
-**Worker count guidance:**
-- `2` is suitable for a B2/B3 App Service Plan.
-- For P2v3/P3v3 plans, increase to `-w 4`.
-- Do not exceed `2 × CPU cores + 1`.
+Worker count guidance: `2` for B2/B3 plans, `4` for P2v3/P3v3. Do not exceed `2 × CPU + 1`.
 
 ### App Service Configuration
 
 1. **Runtime stack:** Python 3.11
 2. **Operating system:** Linux
 3. **Startup command:** (see above)
-4. **App Settings:** Add all variables from `.env.example` (no secrets needed)
-5. **System-assigned managed identity:** Enable under Identity → System assigned
+4. **App Settings:** Add all variables from `.env.example` — remember to override `ALLOWED_ORIGINS` with your production domains.
+5. **System-assigned managed identity:** Enable under Identity → System assigned.
 
-### Deployment Steps
+### Deployment
 
 ```bash
-# Option A — ZIP deploy via Azure CLI
+# ZIP deploy via Azure CLI
 az webapp deploy \
   --resource-group <rg> \
   --name <app-name> \
   --src-path . \
   --type zip
-
-# Option B — GitHub Actions (recommended for CI/CD)
-# Use the "Deploy to Azure Web App" action with OIDC federated credentials.
 ```
 
 ---
@@ -346,51 +326,33 @@ az role assignment create \
   --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Search/searchServices/<search-resource>
 ```
 
-> **Note:** Role assignments can take up to 5 minutes to propagate.
+> Role assignments can take up to 5 minutes to propagate.
 
 ---
 
-## Retrieval Pipeline Overview
+## Retrieval Pipeline
 
 ```
 POST /chat (or /chat/stream)
   │
-  ├─ 1.  Distil keyword query (strip conversational filler)
+  ├─ 1.  Distil keyword query (strip conversational filler → better BM25)
   ├─ 2.  Generate query embedding via Azure OpenAI Ada-002
   ├─ 3.  Hybrid search: BM25 + VectorizedQuery → RETRIEVAL_CANDIDATES results
   ├─ 4.  Optional semantic reranking (USE_SEMANTIC_RERANKER=true)
   ├─ 5.  Normalise → canonical result schema, sorted by effective score
-  ├─ 6.  Filter Table-of-Contents pages
+  ├─ 6.  Filter Table-of-Contents / index pages
   ├─ 7.  Adaptive diversity cap (per-source cap, dominant-source relaxation)
   ├─ 8.  Score-gap filter (drop bottom fraction by score ratio)
   ├─ 9.  Trim to TOP_K
-  ├─ 10. Confidence gate — checks TOP chunk score (not average):
-  │        MIN_RESULTS=1 (default) → one strong chunk is sufficient
+  ├─ 10. Confidence gate — evaluates TOP chunk score (not average):
+  │        MIN_RESULTS=1: one strong chunk is sufficient
   │        Gate fail → 200 with clarifying question, citations=[]
-  ├─ 11. Build citations from retrieval results (always — not from LLM text)
+  ├─ 11. Build citations from retrieval results
+  │        Always from retrieval — never from LLM answer text
   ├─ 12. Azure OpenAI chat completion (non-streaming or streaming)
-  └─ 13. Return ChatResponse with answer + citations
-         HTTP 502 if step 3 or step 12 throws an exception
+  │        Failure → HTTP 502 (JSON) or event: error (SSE)
+  └─ 13. Return ChatResponse{answer, citations, session_id}
 ```
-
----
-
-## Multi-Turn Conversation
-
-History is **disabled by default** (`ENABLE_IN_MEMORY_HISTORY=false`) — every request is independent (stateless).
-
-This is the safe default for App Service because:
-- Scale-out creates multiple instances that do not share in-memory state.
-- Restarts silently clear history, confusing users mid-conversation.
-
-To enable for local development:
-```
-ENABLE_IN_MEMORY_HISTORY=true
-```
-
-When enabled, the last 10 turns (20 messages) are retained per `session_id`.
-For persistent multi-turn history in production, extend `app/services/chat.py`
-to read/write from Azure Cosmos DB or Azure Table Storage.
 
 ---
 

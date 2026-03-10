@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
-from app.config.settings import ALLOWED_ORIGINS, CORS_ALLOW_CREDENTIALS
+from app.config.settings import ALLOWED_ORIGINS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,10 +32,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Authentication: DefaultAzureCredential (Managed Identity / Azure CLI)"
     )
-    if ALLOWED_ORIGINS:
-        logger.info("CORS: specific origins=%s credentials=True", ALLOWED_ORIGINS)
-    else:
-        logger.info("CORS: wildcard (*) mode — credentials=False")
+    logger.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
     yield
     logger.info("PSEG Tech Manual Chat Backend shutting down")
 
@@ -50,23 +47,24 @@ app = FastAPI(
         "**Streaming endpoint:** `POST /chat/stream` — Server-Sent Events for "
         "live token streaming."
     ),
-    version="2.1.0",
+    version="2.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Rules:
-#   - allow_origins=["*"] + allow_credentials=True is INVALID per CORS spec.
-#     Browsers reject such responses with a CORS error.
-#   - When ALLOWED_ORIGINS is set:  use specific origins + allow_credentials=True
-#   - When ALLOWED_ORIGINS is empty: wildcard mode + allow_credentials=False
-#     (safe for most Power Apps / PCF call patterns that use bearer tokens)
+# ALLOWED_ORIGINS is always a list of explicit origins (never a wildcard).
+# Default: ["http://localhost:3000", "http://localhost:8000"] for local dev.
+# Production: set ALLOWED_ORIGINS env var to your Power Apps / PCF domains.
+#
+# Because we always use a specific origin list, allow_credentials=True is
+# valid here. The CORS spec only forbids combining allow_origins=["*"] with
+# allow_credentials=True — explicit origin lists are always safe with credentials.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
-    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "Accept"],
 )

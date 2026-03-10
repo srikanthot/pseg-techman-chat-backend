@@ -30,19 +30,18 @@ AZURE_SEARCH_INDEX: str = os.getenv("AZURE_SEARCH_INDEX", "rag-psegtechm-index-f
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Comma-separated list of allowed origins.
-# Leave blank for wildcard mode (allow_origins=["*"], allow_credentials=False).
-# Set to specific origins to enable credential-bearing requests:
-#   ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.dynamics.com
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
-ALLOWED_ORIGINS: list[str] = (
-    [o.strip() for o in _raw_origins.split(",") if o.strip()]
-    if _raw_origins
-    else []
-)
-# Wildcard mode is active when ALLOWED_ORIGINS is empty.
-# Per the CORS spec, allow_origins=["*"] MUST NOT be combined with
-# allow_credentials=True — browsers will reject such responses.
-CORS_ALLOW_CREDENTIALS: bool = bool(ALLOWED_ORIGINS)
+#
+# The default covers local development (Swagger UI, curl, local frontends).
+# For production (Power Apps / PCF), override with your actual origins:
+#   ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.crm.dynamics.com
+#
+# Because we always use a specific origin list (never a wildcard), we can safely
+# set allow_credentials=True in the CORS middleware without violating the CORS spec.
+# The spec forbids allow_origins=["*"] + allow_credentials=True; using an explicit
+# list avoids this entirely.
+_DEFAULT_ORIGINS = "http://localhost:3000,http://localhost:8000"
+_raw_origins = os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).strip()
+ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 # ── Index field mappings ──────────────────────────────────────────────────────
 # These must match the actual field names in your Azure AI Search index schema.
@@ -69,15 +68,16 @@ USE_SEMANTIC_RERANKER: bool = os.getenv("USE_SEMANTIC_RERANKER", "true").lower()
 SEMANTIC_CONFIG_NAME: str = os.getenv("SEMANTIC_CONFIG_NAME", "manual-semantic-config")
 QUERY_LANGUAGE: str = os.getenv("QUERY_LANGUAGE", "en-us")
 
-# Minimum number of retrieved chunks before attempting generation.
-# Default is 1 — a single highly relevant chunk is sufficient.
-# Raise to 2+ for stricter environments.
+# Minimum number of retrieved chunks required before attempting generation.
+# Default is 1 — a single highly relevant chunk is sufficient to produce a
+# grounded answer. Raise to 2+ only for stricter citation-count requirements.
 MIN_RESULTS: int = int(os.getenv("MIN_RESULTS", "1"))
 
 # Gate threshold applied to the TOP chunk's score (not the average).
-# Scoring depends on reranker mode:
-#   - With semantic reranker: reranker_score range 0.0 – 4.0
-#   - Without reranker:       RRF / hybrid score range 0.01 – 0.033
+# Using the top score avoids rejecting responses when one excellent chunk
+# is accompanied by lower-scoring supporting chunks.
+#   With semantic reranker: reranker_score range 0.0 – 4.0
+#   Without reranker:       RRF / hybrid score range 0.01 – 0.033
 MIN_AVG_SCORE: float = float(os.getenv("MIN_AVG_SCORE", "0.01"))
 MIN_RERANKER_SCORE: float = float(os.getenv("MIN_RERANKER_SCORE", "0.2"))
 
