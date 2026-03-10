@@ -1,0 +1,44 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+# DO NOT commit .env — it may contain secrets or credentials
+.env
+*.env.local
+*.env.*.local
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Azure ─────────────────────────────────────────────────────────────────────
+.azure/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage

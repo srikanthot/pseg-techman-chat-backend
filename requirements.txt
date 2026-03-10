@@ -1,0 +1,19 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]>=0.31.1
+gunicorn>=22.0.0
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+pydantic>=2,<3
+
+# ── Azure Identity (Managed Identity / DefaultAzureCredential) ────────────────
+azure-identity>=1.17.0
+
+# ── Azure AI Search ───────────────────────────────────────────────────────────
+# 11.6.0b3 required for VectorizedQuery + semantic reranker support
+azure-search-documents==11.6.0b3
+
+# ── Azure OpenAI ──────────────────────────────────────────────────────────────
+# Requires AsyncAzureOpenAI and azure_ad_token_provider support (1.x series)
+openai>=1.30.0
