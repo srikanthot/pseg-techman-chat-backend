@@ -40,41 +40,44 @@ _PING_INTERVAL_SECS = 20  # keepalive ping interval for SSE connections
 def _check_gate(results: list[dict]) -> tuple[bool, str]:
     """Return (passed, rejection_reason).
 
-    Gate logic — practical for technical manual Q&A:
+    Gate logic — score-first evaluation:
 
-    1. Require at least MIN_RESULTS chunks (default 1).
-       A single highly relevant chunk is sufficient — we do not hard-fail
-       just because fewer than 2 chunks were retrieved.
+    A single highly relevant chunk passes the gate when its score meets the
+    configured threshold, regardless of how many total chunks were retrieved.
+    MIN_RESULTS is NOT a hard prerequisite for passing — we do not hard-fail
+    solely because fewer chunks than MIN_RESULTS were retrieved.
 
-    2. Evaluate the TOP chunk's score (not the average).
-       This avoids penalising responses when one excellent chunk is
-       accompanied by weaker supporting chunks. Average-based gating
-       would incorrectly reject such cases.
+    Pass condition (either mode):
+      - At least 1 result AND top chunk score >= threshold
 
     Score ranges by mode:
       - Semantic reranker on:  reranker_score  0.0 – 4.0   (threshold: MIN_RERANKER_SCORE)
       - Semantic reranker off: base RRF score  0.01 – 0.033 (threshold: MIN_AVG_SCORE)
     """
-    if len(results) < MIN_RESULTS:
-        return False, f"retrieved {len(results)} chunk(s) — minimum is {MIN_RESULTS}"
+    if not results:
+        return False, "no chunks retrieved"
 
     # results are pre-sorted by effective score descending; index 0 is the top chunk
     top = results[0]
 
     if USE_SEMANTIC_RERANKER and top.get("reranker_score") is not None:
         top_score = top["reranker_score"]
-        if top_score < MIN_RERANKER_SCORE:
-            return (
-                False,
-                f"top reranker score {top_score:.3f} < threshold {MIN_RERANKER_SCORE}",
-            )
-        return True, ""
+        if top_score >= MIN_RERANKER_SCORE:
+            # Strong top-chunk score — one relevant chunk is sufficient
+            return True, ""
+        reason = f"top reranker score {top_score:.3f} < threshold {MIN_RERANKER_SCORE}"
+        if len(results) < MIN_RESULTS:
+            reason += f"; retrieved {len(results)} chunk(s) — minimum is {MIN_RESULTS}"
+        return False, reason
 
     # Fall back to base RRF / hybrid score
     top_score = top["score"]
-    if top_score < MIN_AVG_SCORE:
-        return False, f"top score {top_score:.4f} < threshold {MIN_AVG_SCORE}"
-    return True, ""
+    if top_score >= MIN_AVG_SCORE:
+        return True, ""
+    reason = f"top score {top_score:.4f} < threshold {MIN_AVG_SCORE}"
+    if len(results) < MIN_RESULTS:
+        reason += f"; retrieved {len(results)} chunk(s) — minimum is {MIN_RESULTS}"
+    return False, reason
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
