@@ -23,11 +23,13 @@ AZURE_OPENAI_CHAT_DEPLOYMENT_NAME: str = os.getenv(
 )
 AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: str = os.environ["AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT"]
 
-# Managed Identity token scope for Azure OpenAI.
+# Managed Identity token endpoint for Azure OpenAI.
+# Read by both the Agent Framework SDK (AzureOpenAIChatClient) and our
+# get_openai_token_provider() helper (used by the plain openai embeddings client).
 # Commercial Azure (default): https://cognitiveservices.azure.com/.default
 # Azure Government / GCC High:  https://cognitiveservices.azure.us/.default
-AZURE_OPENAI_TOKEN_SCOPE: str = os.getenv(
-    "AZURE_OPENAI_TOKEN_SCOPE",
+AZURE_OPENAI_TOKEN_ENDPOINT: str = os.getenv(
+    "AZURE_OPENAI_TOKEN_ENDPOINT",
     "https://cognitiveservices.azure.com/.default",
 )
 

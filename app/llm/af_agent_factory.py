@@ -11,8 +11,12 @@ It creates two module-level singletons consumed by AgentRuntime:
                  pre-fetched chunks without a second Azure AI Search query.
 
 Key Agent Framework SDK primitives used here:
-  AzureOpenAIChatClient   — wraps Azure OpenAI; accepts azure_ad_token_provider
+  AzureOpenAIChatClient   — wraps Azure OpenAI; accepts credential=DefaultAzureCredential()
                             so no API key is ever needed or stored.
+                            Reads AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION,
+                            AZURE_OPENAI_CHAT_DEPLOYMENT_NAME, and
+                            AZURE_OPENAI_TOKEN_ENDPOINT from environment variables;
+                            handles token acquisition internally.
   client.as_agent()       — the official SDK factory that returns a ChatAgent
                             configured with a system prompt and context_providers.
   InMemoryHistoryProvider — Agent Framework built-in provider that stores
@@ -23,10 +27,10 @@ Key Agent Framework SDK primitives used here:
                             injects retrieved chunks as grounded context via
                             context.extend_instructions() before each LLM call.
 
-Managed Identity vs agentv01 (API key):
-  agentv01:  AzureOpenAIChatClient()                  # reads AZURE_OPENAI_API_KEY from env
-  this repo: AzureOpenAIChatClient(                   # uses DefaultAzureCredential token
-                 azure_ad_token_provider=token_fn)    # — no key, auto-refreshes
+Managed Identity vs API key:
+  API key approach : AzureOpenAIChatClient(api_key="...")
+  this repo        : AzureOpenAIChatClient(credential=DefaultAzureCredential())
+                     — no key, token auto-refreshes via managed identity
 """
 
 import logging
@@ -37,7 +41,7 @@ from agent_framework.azure import AzureOpenAIChatClient
 from app.agent_runtime.af_rag_context_provider import RagContextProvider
 from app.agent_runtime.prompts import SYSTEM_PROMPT
 from app.config.settings import ENABLE_IN_MEMORY_HISTORY
-from app.llm.credentials import get_openai_token_provider
+from app.llm.credentials import get_credential
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +52,13 @@ logger = logging.getLogger(__name__)
 rag_provider = RagContextProvider()
 
 # ── AzureOpenAIChatClient (Managed Identity) ──────────────────────────────────
-# azure_ad_token_provider is passed through to the underlying openai.AzureOpenAI
-# instance which auto-refreshes the token before expiry.
-# The client still reads AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, and
-# AZURE_OPENAI_CHAT_DEPLOYMENT_NAME from environment variables.
+# Pass credential=DefaultAzureCredential() — the Agent Framework SDK internally
+# calls get_bearer_token_provider(credential, AZURE_OPENAI_TOKEN_ENDPOINT) and
+# passes the result to AsyncAzureOpenAI as azure_ad_token_provider.
+# The client reads AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, and
+# AZURE_OPENAI_CHAT_DEPLOYMENT_NAME directly from environment variables.
 _client = AzureOpenAIChatClient(
-    azure_ad_token_provider=get_openai_token_provider(),
+    credential=get_credential(),
 )
 
 # ── Context providers list ────────────────────────────────────────────────────

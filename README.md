@@ -45,8 +45,8 @@ AgentRuntime (agent_runtime/agent.py)
               │    context.extend_instructions() → appended to system prompt
               │
               └─ AzureOpenAIChatClient                  ← Azure OpenAI (managed identity)
-                   azure_ad_token_provider=get_bearer_token_provider(
-                       DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+                   credential=DefaultAzureCredential()
+                   (SDK reads AZURE_OPENAI_TOKEN_ENDPOINT from env; handles token internally)
                    streams tokens → update.text
 ```
 
@@ -225,7 +225,7 @@ Open http://localhost:8000/docs for interactive API docs.
 | `AZURE_OPENAI_CHAT_DEPLOYMENT` | Yes | — | Chat model deployment name |
 | `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` | No | same as above | Agent Framework SDK alias — keep in sync |
 | `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT` | Yes | — | Embeddings deployment name |
-| `AZURE_OPENAI_TOKEN_SCOPE` | No | `https://cognitiveservices.azure.com/.default` | GCC High: `https://cognitiveservices.azure.us/.default` |
+| `AZURE_OPENAI_TOKEN_ENDPOINT` | No | `https://cognitiveservices.azure.com/.default` | Read by AF SDK (`AzureOpenAIChatClient`) and embeddings client. GCC High: `https://cognitiveservices.azure.us/.default` |
 
 ### Azure AI Search
 
@@ -359,7 +359,7 @@ az role assignment create --assignee $PRINCIPAL_ID \
 ## GCC High (Azure Government)
 
 ```
-AZURE_OPENAI_TOKEN_SCOPE=https://cognitiveservices.azure.us/.default
+AZURE_OPENAI_TOKEN_ENDPOINT=https://cognitiveservices.azure.us/.default
 AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.us/
 AZURE_SEARCH_ENDPOINT=https://<search>.search.azure.us
 ```
