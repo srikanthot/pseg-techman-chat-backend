@@ -1,9 +1,9 @@
 """
-Application configuration loaded from environment variables.
+Application configuration — loaded from environment variables via python-dotenv.
 
-No secrets are stored here. All authentication uses Managed Identity
-(DefaultAzureCredential) — works locally via Azure CLI login and on
-Azure App Service via system-assigned managed identity.
+Authentication model: Managed Identity (DefaultAzureCredential).
+No API keys. No secrets. Works locally via `az login` and on Azure App Service
+via the system-assigned managed identity without any code changes.
 """
 
 import os
@@ -17,34 +17,40 @@ AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-0
 AZURE_OPENAI_CHAT_DEPLOYMENT: str = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"]
 AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: str = os.environ["AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT"]
 
-# Azure AD token scope for OpenAI.
-# For Azure Government (GCC High): https://cognitiveservices.azure.us/.default
+# Managed Identity token scope for Azure OpenAI.
+# Commercial Azure (default): https://cognitiveservices.azure.com/.default
+# Azure Government / GCC High:  https://cognitiveservices.azure.us/.default
 AZURE_OPENAI_TOKEN_SCOPE: str = os.getenv(
     "AZURE_OPENAI_TOKEN_SCOPE",
     "https://cognitiveservices.azure.com/.default",
 )
 
 # ── Azure AI Search ───────────────────────────────────────────────────────────
+# Authentication: DefaultAzureCredential passed directly to SearchClient.
+# No AZURE_SEARCH_API_KEY is read or required.
 AZURE_SEARCH_ENDPOINT: str = os.environ["AZURE_SEARCH_ENDPOINT"]
 AZURE_SEARCH_INDEX: str = os.getenv("AZURE_SEARCH_INDEX", "rag-psegtechm-index-finalv2")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Comma-separated list of allowed origins.
+# ALLOWED_ORIGINS is a comma-separated list of allowed origins.
 #
-# The default covers local development (Swagger UI, curl, local frontends).
-# For production (Power Apps / PCF), override with your actual origins:
+# Default (when env var is not set):
+#   http://localhost:3000,http://localhost:8000
+#   Covers local Swagger UI, curl, and local frontends during development.
+#
+# For production (Power Apps / PCF), override with your actual domain(s):
 #   ALLOWED_ORIGINS=https://apps.powerapps.com,https://your-org.crm.dynamics.com
 #
-# Because we always use a specific origin list (never a wildcard), we can safely
-# set allow_credentials=True in the CORS middleware without violating the CORS spec.
-# The spec forbids allow_origins=["*"] + allow_credentials=True; using an explicit
-# list avoids this entirely.
-_DEFAULT_ORIGINS = "http://localhost:3000,http://localhost:8000"
-_raw_origins = os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).strip()
+# Why we never use allow_origins=["*"]:
+#   The CORS spec forbids combining allow_origins=["*"] with allow_credentials=True.
+#   All modern browsers enforce this — they will block such responses.
+#   By always using a specific origin list we can safely set allow_credentials=True.
+_DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://localhost:8000"
+_raw_origins: str = os.getenv("ALLOWED_ORIGINS", _DEFAULT_CORS_ORIGINS).strip()
 ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 # ── Index field mappings ──────────────────────────────────────────────────────
-# These must match the actual field names in your Azure AI Search index schema.
+# Must match the actual field names in your Azure AI Search index schema exactly.
 SEARCH_CONTENT_FIELD: str = os.getenv("SEARCH_CONTENT_FIELD", "chunk")
 SEARCH_SEMANTIC_CONTENT_FIELD: str = os.getenv("SEARCH_SEMANTIC_CONTENT_FIELD", "chunk_for_semantic")
 SEARCH_VECTOR_FIELD: str = os.getenv("SEARCH_VECTOR_FIELD", "text_vector")
@@ -55,29 +61,29 @@ SEARCH_TITLE_FIELD: str = os.getenv("SEARCH_TITLE_FIELD", "title")
 SEARCH_SECTION1_FIELD: str = os.getenv("SEARCH_SECTION1_FIELD", "header_1")
 SEARCH_SECTION2_FIELD: str = os.getenv("SEARCH_SECTION2_FIELD", "header_2")
 SEARCH_SECTION3_FIELD: str = os.getenv("SEARCH_SECTION3_FIELD", "header_3")
-# Leave blank if your index has no page number field
-SEARCH_PAGE_FIELD: str = os.getenv("SEARCH_PAGE_FIELD", "")
+SEARCH_PAGE_FIELD: str = os.getenv("SEARCH_PAGE_FIELD", "")  # blank = index has no page field
 
 # ── Retrieval tuning ──────────────────────────────────────────────────────────
-TOP_K: int = int(os.getenv("TOP_K", "5"))                          # max chunks returned after all filtering
-RETRIEVAL_CANDIDATES: int = int(os.getenv("RETRIEVAL_CANDIDATES", "15"))  # raw candidates from Azure Search
-VECTOR_K: int = int(os.getenv("VECTOR_K", "50"))                   # nearest-neighbor count for vector query
+TOP_K: int = int(os.getenv("TOP_K", "5"))                    # max chunks after all filtering
+RETRIEVAL_CANDIDATES: int = int(os.getenv("RETRIEVAL_CANDIDATES", "15"))  # raw Azure Search pool
+VECTOR_K: int = int(os.getenv("VECTOR_K", "50"))             # kNN neighbours for vector query
 
-# ── Quality / confidence gate ─────────────────────────────────────────────────
+# ── Confidence gate ───────────────────────────────────────────────────────────
 USE_SEMANTIC_RERANKER: bool = os.getenv("USE_SEMANTIC_RERANKER", "true").lower() == "true"
 SEMANTIC_CONFIG_NAME: str = os.getenv("SEMANTIC_CONFIG_NAME", "manual-semantic-config")
 QUERY_LANGUAGE: str = os.getenv("QUERY_LANGUAGE", "en-us")
 
-# Minimum number of retrieved chunks required before attempting generation.
-# Default is 1 — a single highly relevant chunk is sufficient to produce a
-# grounded answer. Raise to 2+ only for stricter citation-count requirements.
+# Minimum number of chunks required before the gate allows generation.
+# Default is 1 — a single highly relevant chunk is sufficient.
+# The gate does NOT hard-fail just because fewer than 2 chunks were retrieved.
+# Raise to 2+ only for stricter multi-citation requirements.
 MIN_RESULTS: int = int(os.getenv("MIN_RESULTS", "1"))
 
-# Gate threshold applied to the TOP chunk's score (not the average).
-# Using the top score avoids rejecting responses when one excellent chunk
-# is accompanied by lower-scoring supporting chunks.
-#   With semantic reranker: reranker_score range 0.0 – 4.0
-#   Without reranker:       RRF / hybrid score range 0.01 – 0.033
+# Thresholds applied to the TOP chunk's score — not the average score.
+# Using the top score avoids rejecting responses where one strong chunk exists
+# alongside lower-scoring supporting chunks.
+#   Semantic reranker mode: reranker_score range 0.0 – 4.0
+#   Hybrid / RRF mode:      base score      range 0.01 – 0.033
 MIN_AVG_SCORE: float = float(os.getenv("MIN_AVG_SCORE", "0.01"))
 MIN_RERANKER_SCORE: float = float(os.getenv("MIN_RERANKER_SCORE", "0.2"))
 
@@ -88,10 +94,17 @@ DOMINANT_SOURCE_SCORE_RATIO: float = float(os.getenv("DOMINANT_SOURCE_SCORE_RATI
 MAX_CHUNKS_DOMINANT_SOURCE: int = int(os.getenv("MAX_CHUNKS_DOMINANT_SOURCE", "4"))
 SCORE_GAP_MIN_RATIO: float = float(os.getenv("SCORE_GAP_MIN_RATIO", "0.55"))
 
-# ── Session / conversation history ────────────────────────────────────────────
-# Disabled by default — the backend is stateless, which is safe for App Service
-# scale-out and restarts. Enable only for single-instance local development or
-# when you accept that history will reset on restart / scale events.
+# ── In-memory conversation history ────────────────────────────────────────────
+# DISABLED by default — the backend is stateless.
+#
+# Stateless (false, default):
+#   Every request is independent. Safe for App Service scale-out (instances
+#   do not share in-process memory) and restarts (no silent data loss).
+#
+# Enabled (true):
+#   Lightweight in-process history per session_id (last 10 turns retained).
+#   Only suitable for single-instance local dev or demos.
+#   History is lost on restart or scale-out — not suitable for production.
 ENABLE_IN_MEMORY_HISTORY: bool = (
     os.getenv("ENABLE_IN_MEMORY_HISTORY", "false").lower() == "true"
 )
