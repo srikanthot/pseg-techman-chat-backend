@@ -1,4 +1,4 @@
-# LLM Guardrails — PII Redaction # MANGOS Guardrails — Safety Middleware for RAG Prompt-Injection Defense
+# LLM Guardrails — PII Redaction & Prompt-Injection Defense for RAG
 
 > Reusable **guardrail middleware** for RAG/LLM services: grounding & hallucination checks (refuse when unsupported), PII detection & redaction, and prompt-injection defense — drop-in for any FastAPI RAG backend.
 
@@ -25,7 +25,7 @@ flowchart TD
 
 ## Status
 - **Implemented:** a production-shaped RAG backend (Microsoft Agent Framework, hybrid BM25+vector, managed identity, **confidence/score-first gate**, citation-from-retrieval only).
-- **Focus (this repo):** package the guardrails as standalone middleware — grounding/faithfulness check, PII redaction (Presidio), input/output filters — usable by any of the other MANGOS services.
+- **Focus (this repo):** package the guardrails as standalone middleware — grounding/faithfulness check, PII redaction (Presidio), input/output filters — usable by any of the other RAG services.
 
 ## Quickstart
 ```bash
